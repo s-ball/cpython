@@ -45,6 +45,7 @@ internationalized, to the local language and cultural habits.
 # - Support Solaris .mo file formats.  Unfortunately, we've been unable to
 #   find this format documented anywhere.
 
+# Additions from s-ball to allow lazy loading of .mo file
 
 import locale
 import os
@@ -777,3 +778,287 @@ def npgettext(context, msgid1, msgid2, n):
 # gettext.
 
 Catalog = translation
+
+######################################################################
+# Copyright 2018 s-ball: compile po files into a mo file
+# Original version: msgfmt.py
+# Written by Martin v. Löwis <loewis@informatik.hu-berlin.de>
+# Compile a list of po files into a mo file
+######################################################################
+
+
+from email.parser import HeaderParser
+import ast
+import struct
+import array
+import math
+import warnings
+
+
+class PoError(Exception):
+    """Raised when a syntax error is encountered in a po file
+
+Parameters:
+    txt:    detail on the error
+    infile: name of the file where the error was found
+    lno:    line number where the error was found
+"""
+    
+    def __init__(self, txt, infile, lno):
+        self.message, self.infile, self.lno = tst, infile, lno
+
+    def __str__(self):
+        return "{} on {}:{}".format(self.message, self.infile, self.lno)
+
+
+class MoCompiler:
+    """Helper class to compile po files into a mo file
+
+Parameters:
+    mofile:   name of the mo file to be generated
+    use_hash: if True, the mo file will contain a hash table
+"""
+    
+    def __init__(self, mofile, use_hash):
+        self.mofile = mofile
+        self.messages = {}
+        self.use_hash = use_hash
+
+    def add(self, ctxt, id, str, fuzzy, infile):
+        """Add a non-fuzzy translation to the dictionary.
+
+Parameters:
+    ctxt:   context for the id or None
+    id:     id (untranslated string)
+    str:    translated string
+    fuzzy:  boolean asking to ignore the string
+    infile: name of the file where the string is declared
+
+Adds the string to the current mo file if fuzzy is False.
+The string is ignored and a warning is raised if the string has already
+be declared in another po source file.
+"""
+        if not fuzzy and str:
+            if 0 in id:
+                key = id.split(b'\x00')[0]
+            else:
+                key = id
+            if ctxt is None:
+                if key in self.messages:
+                    warnings.warn("String {key} ignored in {file}:"
+                                  " already defined in {old}",
+                                  {"key": key, "file": infile,
+                                   "old": self.messages[key][2]})
+                else:
+                    self.messages[key] = id, str, infile
+            else:
+                ckey = b"%b\x04%b" % (ctxt, key)
+                if ckey in self.messages:
+                    warnings.warn("String {key} with context {ctxt} ignored"
+                                  " in {file}: already defined in {old}",
+                                  {"key": key, "ctxt": ctxt, "file": infile,
+                                   "old": self.messages[key][2]})
+                else:
+                    self.messages[ckey] = (b"%b\x04%b" % (ctxt, id),
+                                           str, infile)
+
+    def parse(self, infile):
+        """Process a source po file"""
+        ID = 1
+        STR = 2
+        CTXT = 3
+
+        section = msgctxt = None
+        fuzzy = 0
+
+        # Start off assuming Latin-1, so everything decodes without failure,
+        # until we know the exact encoding
+        encoding = 'latin-1'
+
+        # Parse the catalog
+        lno = 0
+        with open(infile, 'rb') as f:
+            for l in f:
+                l = l.decode(encoding)
+                lno += 1
+                # If we get a comment line after a msgstr, this is a new entry
+                if l[0] == '#' and section == STR:
+                    self.add(msgctxt, msgid, msgstr, fuzzy)
+                    section = msgctxt = None
+                    fuzzy = 0
+                # Record a fuzzy mark
+                if l[:2] == '#,' and 'fuzzy' in l:
+                    fuzzy = 1
+                # Skip comments
+                if l[0] == '#':
+                    continue
+                # Now we are in a msgid or msgctxt section, output previous section
+                if l.startswith('msgctxt'):
+                    if section == STR:
+                        self.add(msgctxt, msgid, msgstr, fuzzy)
+                    section = CTXT
+                    l = l[7:]
+                    msgctxt = b''
+                elif l.startswith('msgid') and not l.startswith('msgid_plural'):
+                    if section == STR:
+                        self.add(msgctxt, msgid, msgstr, fuzzy)
+                        if not msgid:
+                            # See whether there is an encoding declaration
+                            p = HeaderParser()
+                            charset = p.parsestr(msgstr.decode(encoding)).get_content_charset()
+                            if charset:
+                                encoding = charset
+                        msgctxt = None
+                    section = ID
+                    l = l[5:]
+                    msgid = msgstr = b''
+                    is_plural = False
+                # This is a message with plural forms
+                elif l.startswith('msgid_plural'):
+                    if section != ID:
+                        raise PoError('msgid_plural not preceded by msgid',
+                                      infile, lno)
+                    l = l[12:]
+                    msgid += b'\0' # separator of singular and plural
+                    is_plural = True
+                # Now we are in a msgstr section
+                elif l.startswith('msgstr'):
+                    section = STR
+                    if l.startswith('msgstr['):
+                        if not is_plural:
+                            raise PoError('plural without msgid_plural',
+                                          infile, lno)
+                        l = l.split(']', 1)[1]
+                        if msgstr:
+                            msgstr += b'\0' # Separator of the various plural forms
+                    else:
+                        if is_plural:
+                            raise PoError('indexed msgstr required for plural',
+                                          infile, lno)
+                        l = l[6:]
+                # Skip empty lines
+                l = l.strip()
+                if not l:
+                    continue
+                l = ast.literal_eval(l)
+                if section == CTXT:
+                    msgctxt += l.encode(encoding)
+                elif section == ID:
+                    msgid += l.encode(encoding)
+                elif section == STR:
+                    msgstr += l.encode(encoding)
+                else:
+                    raise PoError('Syntax error before:' + l,
+                                  infile, lno)
+        # Add last entry
+        if section == STR:
+            self.add(msgctxt, msgid, msgstr, fuzzy)
+
+    def generate(self):
+        "Generates the output file."
+        # the keys are sorted in the .mo file
+        keys = sorted(self.messages.keys())
+        offsets = []
+        ids = strs = b''
+        for key in keys:
+            # For each string, we need size and file offset.  Each string is
+            # NUL terminated; the NUL does not count into the size.
+            id, str = self.messages[key]
+            offsets.append((len(ids), len(id), len(strs), len(str)))
+            ids += id + b'\0'
+            strs += str + b'\0'
+        output = ''
+        # The header is 7 32-bit unsigned integers.
+        htab_size = self.hash_tab_size() if self.use_hash else 0
+        htabstart = 7*4 + 16*len(keys)
+        # translated string.
+        keystart = htabstart + 4*htab_size
+        # and the values start after the keys
+        valuestart = keystart + len(ids)
+        koffsets = []
+        voffsets = []
+        # The string table first has the list of keys, then the list of values.
+        # Each entry has first the size of the string, then the file offset.
+        for o1, l1, o2, l2 in offsets:
+            koffsets += [l1, o1+keystart]
+            voffsets += [l2, o2+valuestart]
+        offsets = koffsets + voffsets
+        output = struct.pack("Iiiiiii",
+                             0x950412de,       # Magic
+                             0,                 # Version
+                             len(keys),         # # of entries
+                             7*4,               # start of key index
+                             7*4+len(keys)*8,   # start of value index
+                             htab_size, htabstart) # size offset of hash table
+        # compute hash table
+        if self.use_hash:
+            ht = array.array("i", [0] * htab_size)
+            for i, key in enumerate(keys, 1):
+                hval = hashval(key)
+                index = hval % htab_size
+                if ht[index] != 0:
+                    delta = 1 + hval%(htab_size - 2)
+                    while True:
+                        index += delta
+                        if index >= htab_size:
+                            index -= htab_size
+                        if ht[index] == 0:
+                            break
+                ht[index] = i
+        # write file                
+        with open(self.mofile, "wb") as fd:
+            _ = fd.write(output)
+            array.array("i", offsets).tofile(fd)
+            if self.use_hash:
+                ht.tofile(fd)
+            fd.write(ids)
+            fd.write(strs)
+
+    def hash_tab_size(self):
+        """The size of the hash table is the first odd prime above
+4 * 3 * nitems where nitems is the number of strings"""
+        size = len(self.messages) * 4 // 3
+        size |= 1          # ensure odd value
+        while True:
+            sq = int(math.sqrt(size) + 1.5)
+            for div in range(3, sq, 2):
+                if size % div == 0:
+                    size += 2
+                    break
+            else:
+                return size
+        
+
+def mo_compile(output, inputs, use_hash=False):
+    """Compile one or more po source files into a mo file.
+
+Parameters:
+    output:   name of the output mo file
+    inputs:   either a string for a single po file or an iterable of strings
+                if more than one source file
+    use_hash: boolean asking for the generation of a hash table (default False)
+"""
+    if isinstance(inputs, str):
+        inputs = (inputs,)
+    moc = MoCompiler(output, use_hash)
+    for f in inputs:
+        moc.parse(f)
+    moc.generate()
+
+        
+def hashval(bstr):
+    """Python port of  hashpjw by P.J.Weinberger published in
+[Aho, Sethi, Ullman].
+
+It is specially tweaked to be compatible with GNU gettext hash_string
+function.
+"""
+    val = 0
+    for b in bstr:
+        val = (val << 4) + b
+        g = val & 0xF0000000
+        if g:
+            val ^= g >> 24
+            val ^= g
+    return val
+
