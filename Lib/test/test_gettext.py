@@ -807,7 +807,7 @@ class GettextCacheTestCase(GettextBaseTest):
 
 class MiscTestCase(unittest.TestCase):
     def test__all__(self):
-        blacklist = {'c2py', 'ENOENT'}
+        blacklist = {'c2py', 'ENOENT', 'hashval'}
         support.check__all__(self, gettext, blacklist=blacklist)
 
 

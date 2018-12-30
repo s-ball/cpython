@@ -59,6 +59,7 @@ __all__ = ['NullTranslations', 'GNUTranslations', 'Catalog',
            'dgettext', 'dngettext', 'gettext', 'lgettext', 'ldgettext',
            'ldngettext', 'lngettext', 'ngettext',
            'pgettext', 'dpgettext', 'npgettext', 'dnpgettext',
+           'mo_compile', 'MoCompiler', 'PoError',
            ]
 
 _default_localedir = os.path.join(sys.base_prefix, 'share', 'locale')
